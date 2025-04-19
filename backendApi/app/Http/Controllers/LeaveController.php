@@ -8,10 +8,9 @@ use App\Http\Requests\LeaveUpdateRequest;
 use App\Models\Employee; // 確保引入 Employee 模型
 use App\Models\LeaveType; // 確保引入 LeaveType 模型
 use App\Services\LeaveService;
-use App\Services\LeaveResetService;
+use App\Services\FileService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Response;
 use Illuminate\Support\Facades\Storage;
 use App\Models\Leave;
 use App\Models\File;
@@ -25,12 +24,12 @@ use Illuminate\Support\Facades\Http;
 class LeaveController extends Controller
 {
     protected $leaveService;
-    protected $leaveResetService;
+    protected $fileService;
 
-    public function __construct(LeaveService $leaveService, LeaveResetService $leaveResetService)
+    public function __construct(LeaveService $leaveService, FileService $fileService)
     {
         $this->leaveService = $leaveService;
-        $this->leaveResetService = $leaveResetService;
+        $this->fileService = $fileService;
     }
 
     // 1. 員工申請請假
@@ -125,75 +124,32 @@ class LeaveController extends Controller
     public function requestLeave(LeaveApplyRequest $request): JsonResponse
     {
         try {
-            // 1️⃣ 透過 JWT 取得當前登入者
             $user = auth()->user();
             $leaveType = LeaveType::find($request->input('leave_type_id'));
 
-            // 2️⃣ **資料驗證**
             $data = $request->validated();
-            $data['user_id'] = $user->id; // 由後端自動填入 `user_id`
+            $data['user_id'] = $user->id;
             $data['status'] = 0;
-            $data['start_time'] = $request->input('start_time');
-            $data['attachment'] = null; // **預設 `attachment` 為 `null`，避免未定義錯誤**
+            $data['attachment'] = null;
 
-            // 檢查時間重疊邏輯
-            $startTime = $data['start_time'];
-            $endTime = $data['end_time'];
-            $isOverlap = Leave::where('user_id', $user->id)
-                ->where(function ($query) use ($startTime, $endTime) {
-                    $query->where('start_time', '<', $endTime)
-                        ->where('end_time', '>', $startTime);
-                })
-                ->whereIn('status', [0, 1]) // 只檢查待審核或已通過的請假
-                ->exists();
-
-            if ($isOverlap) {
-                throw new \Exception('您的請假時間與已有的請假紀錄重疊，請調整時間範圍後再重新申請。');
-            }
-            if ($data['start_time'] >= $data['end_time']) {
-                return response()->json(['message' => '請假結束時間必須大於開始時間'], 422);
-            }
-
-            // **如果是假別是生理假，但使用者不是女性，則拒絕請假**
             if ($leaveType->name === 'Menstrual Leave' && $user->gender !== 'female') {
                 return response()->json(['message' => '您無法申請生理假'], 403);
             }
 
-            // 3️⃣ **預先檢查剩餘時數，減少 Service 負擔**
-            $remainingHours = match ($leaveType->name) {
-                'Annual leave' => $this->leaveResetService->getRemainingAnnualLeaveHours($user->id, $data['start_time']),
-                'Menstrual Leave' => $this->leaveResetService->getRemainingMenstrualLeaveHours($user->id, $data['start_time']), // ✅ 傳入 `start_time`
-                default => $this->leaveResetService->getRemainingLeaveHours($data['leave_type_id'], $user->id)
-            };
-
-            if ($remainingHours < $request->input('leave_hours')) {
-                return response()->json([
-                    'message' => "剩餘時數不足，請重新選擇請假區間",
-                ], 400);
-            }
-
-            // 3️⃣ **處理附件**（如果沒有附件，`attachment` 保持 `null`）
+            // attachment
             $fileRecord = null;
             if ($request->hasFile('attachment')) {
                 $file = $request->file('attachment');
-
-                // 產生唯一檔名
-                $filename = Str::uuid() . '.' . $file->getClientOriginalExtension();
-                $attachmentPath = $file->storeAs('attachments', $filename, 'public');
-
-                // **存入 `files` 表**
-                $fileRecord = File::create([
-                    'user_id' => $user->id,
-                    'leave_id' => null, // 先不關聯 `leave_id`，稍後再更新
-                    'leave_attachment' => str_replace('public/', '', $attachmentPath), // ✅ 存成相對路徑
-                ]);
-
-                // **將附件 ID 存入 `$data`，傳遞給 Service**
+                $fileRecord = $this->fileService->uploadLeaveAttachment($file, $user->id);
                 $data['attachment'] = $fileRecord->id;
             }
 
-            // 4️⃣ **呼叫 Service 層處理請假**
+            // call leaveService
             $leave = $this->leaveService->applyLeave($data);
+
+            if ($fileRecord) {
+                $fileRecord->update(['leave_id' => $leave->id]);
+            }
 
             // 取得請假人員的主管 ID（透過 Employee 關聯）
             $employee = Employee::where('user_id', $user->id)->first();
@@ -217,22 +173,15 @@ class LeaveController extends Controller
                 ]);
             }
 
-            // 5️⃣ **如果有附件，更新 `leave_id` 到 `File` 表**
-            if ($fileRecord) {
-                $fileRecord->update(['leave_id' => $leave->id]);
-            }
-
-            // 6️⃣ **回傳成功資訊**
             return response()->json([
                 'message' => '申請成功，假單已送出',
                 'leave' => $this->formatLeave($leave),
-            ], 201); // **201 Created：表示成功建立新資源**
+            ], 201);
 
         } catch (\Throwable $e) {
-            // 7️⃣ **回傳錯誤資訊**
             return response()->json([
                 'message' => $e->getMessage(),
-                'error' => app()->isLocal() ? $e->getMessage() : null, // **本機開發環境才回傳錯誤**
+                'error' => app()->isLocal() ? $e->getMessage() : null,
             ], 500);
         }
     }
@@ -350,11 +299,9 @@ class LeaveController extends Controller
         try {
             $filters = $request->validated();
 
-            // Log::info('查詢請假紀錄', ['user_id' => $user->id, 'filters' => $filters]);
-
             $leaves = $this->leaveService->getLeaveList($user, $filters);
 
-            if ($leaves->total() === 0) {            //這裡開始
+            if ($leaves->total() === 0) {
                 return response()->json([
                     'message' => '查無符合條件的請假紀錄',
                     'records' => [],

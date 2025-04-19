@@ -9,7 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 class Leave extends Model
 {
     use HasFactory;
-    
+
     protected $table = 'leaves';
 
     protected $fillable = [
@@ -25,7 +25,11 @@ class Leave extends Model
     ];
 
     public const STATUSES = [
-        0,1,2,3,4
+        0,
+        1,
+        2,
+        3,
+        4
     ];
 
     public function user()
@@ -47,5 +51,12 @@ class Leave extends Model
     {
         return $this->hasOneThrough(Employee::class, User::class, 'id', 'user_id', 'user_id', 'id');
     }
-    
+
+    public function scopeOverlapping($query, $start, $end)
+    {
+        return $query->where(function ($q) use ($start, $end) {
+            $q->where('start_time', '<', $end)
+                ->where('end_time', '>', $start);
+        });
+    }
 }
