@@ -5,17 +5,14 @@ namespace App\Http\Controllers;
 use App\Http\Requests\LeaveApplyRequest; // Ensure this class exists in the specified namespace
 use App\Http\Requests\LeaveListRequest;
 use App\Http\Requests\LeaveUpdateRequest;
-use App\Models\Employee; // 確保引入 Employee 模型
-use App\Models\LeaveType; // 確保引入 LeaveType 模型
+use App\Models\Employee;
+use App\Models\LeaveType;
 use App\Services\LeaveService;
 use App\Services\FileService;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
 use App\Models\Leave;
-use App\Models\File;
 use Illuminate\Http\Request;
-use Illuminate\Support\Str;
+use App\Formatters\LeaveFormatter;
 
 use App\Models\Notification;
 use Illuminate\Support\Facades\Http;
@@ -175,7 +172,7 @@ class LeaveController extends Controller
 
             return response()->json([
                 'message' => '申請成功，假單已送出',
-                'leave' => $this->formatLeave($leave),
+                'leave' =>  LeaveFormatter::format($leave),
             ], 201);
 
         } catch (\Throwable $e) {
@@ -310,7 +307,7 @@ class LeaveController extends Controller
             }
             return response()->json([
                 'message' => '查詢成功',
-                'records' => $leaves->map(fn($leave) => $this->formatLeave($leave)),
+                'records' => $leaves->map(fn($leave) => LeaveFormatter::format($leave)),
                 'total' => $leaves->total(),
             ], 200);
         } catch (\Exception $e) {
@@ -444,7 +441,7 @@ class LeaveController extends Controller
      *     )
      * )
      */
-    public function viewDepartmentLeaveRecords(Request $request): JsonResponse
+    public function viewDepartmentLeaveRecords(LeaveListRequest $request): JsonResponse
     {
         $user = auth()->user();
 
@@ -453,18 +450,7 @@ class LeaveController extends Controller
         }
 
         try {
-            $filters = $request->validate([
-                'leave_type_id' => 'nullable|exists:leave_types,id',
-                'employee_id' => 'nullable|exists:employees,id',
-                'start_date' => 'required|date',
-                'end_date' => 'required|date|after_or_equal:start_date',
-                'status' => 'nullable|integer|in:0,1,2,3,4',
-                'rejected' => 'nullable|integer',
-                'leave_hours' => 'nullable',
-                'created_at' => 'nullable|date',
-            ]);
-
-            // Log::info('查詢部門請假紀錄', ['user_id' => $user->id, 'filters' => $filters]);
+            $filters = $request->validated();
 
             $leaves = $this->leaveService->getDepartmentLeaveList($user, $filters);
 
@@ -478,7 +464,7 @@ class LeaveController extends Controller
 
             return response()->json([
                 'message' => '查詢成功',
-                'records' => $leaves->map(fn($leave) => $this->formatLeave($leave)),
+                'records' => $leaves->map(fn($leave) => LeaveFormatter::format($leave)),
                 'total' => $leaves->total(),
             ], 200);
         } catch (\Exception $e) {
@@ -622,7 +608,7 @@ class LeaveController extends Controller
      *     )
      * )
      */
-    public function viewCompanyLeaveRecords(Request $request): JsonResponse
+    public function viewCompanyLeaveRecords(LeaveListRequest $request): JsonResponse
     {
         $user = auth()->user();
         if ($user->employee->status === 'inactive') {
@@ -630,22 +616,10 @@ class LeaveController extends Controller
         }
 
         try {
-            // ✅ 查詢所有請假紀錄
-            $filters = $request->validate([
-                'leave_type_id' => 'nullable|exists:leave_types,id',
-                'department_id' => 'nullable|exists:departments,id',
-                'employee_id' => 'nullable|exists:employees,id',
-                'start_date' => 'required|date',
-                'end_date' => 'required|date|after_or_equal:start_date',
-                'status' => 'nullable|integer|in:0,1,2,3,4',
-                'rejected' => 'nullable|integer',
-                'leave_hours' => 'nullable',
-                'created_at' => 'nullable|date',
-            ]);
+            $filters = $request->validated();
 
             $leaves = $this->leaveService->getCompanyLeaveList($filters);
 
-            // 如果沒有任何符合條件的紀錄
             if ($leaves->total() === 0) {
                 return response()->json([
                     'message' => '查無符合條件的請假紀錄',
@@ -654,10 +628,9 @@ class LeaveController extends Controller
                 ], 200);
             }
 
-            // 有紀錄時的回應
             return response()->json([
                 'message' => '查詢成功',
-                'records' => $leaves->map(fn($leave) => $this->formatLeave($leave)),
+                'records' => $leaves->map(fn($leave) => LeaveFormatter::format($leave)),
                 'total' => $leaves->total(),
             ], 200);
         } catch (\Exception $e) {
@@ -778,105 +751,42 @@ class LeaveController extends Controller
         try {
             $user = auth()->user();
 
-            // 1️⃣ 取得請假紀錄
             $leave = Leave::where('id', $id)
                 ->where('user_id', $user->id)
                 ->first();
 
             if (!$leave) {
-                return response()->json(['message' => '查無此假單或您無權限修改'], 403);
+                return response()->json(['message' => '查無此假單'], 403);
             }
 
-            // 取得新的請假類型
-            $newLeaveTypeId = $request->input('leave_type_id', $leave->leave_type_id);
-            $leaveType = LeaveType::find($newLeaveTypeId);
+            $data = $request->validated();
 
-            // **檢查是否修改為生理假，且申請者必須是女性**
+            $leaveType = LeaveType::find($data['leave_type_id'] ?? $leave->leave_type_id);
             if ($leaveType && $leaveType->name === 'Menstrual Leave' && $user->gender !== 'female') {
                 return response()->json(['message' => '您無法申請生理假'], 400);
             }
 
-            //  // 2️⃣ **資料驗證**
-            $data = $request->validated();
-            $data['start_time'] = $request->input('start_time');
-            $data['end_time'] = $request->input('end_time');
-            $data['leave_type_id'] = $request->input('leave_type_id', $leave->leave_type_id); // 預設為原本的假別
-
-            // 檢查時間重疊邏輯
-            $startTime = $data['start_time'];
-            $endTime = $data['end_time'];
-
-            $isOverlap = Leave::where('user_id', $user->id)
-                ->where('id', '!=', $id) // 排除當前假單
-                ->where(function ($query) use ($startTime, $endTime) {
-                    $query->where('start_time', '<', $endTime)
-                        ->where('end_time', '>', $startTime);
-                })
-                ->whereIn('status', [0, 1]) // 只檢查待審核或已通過的請假
-                ->exists();
-
-            if ($isOverlap) {
-                throw new \Exception('您的請假時間與已有的請假紀錄重疊，請調整時間範圍後再重新申請。');
-            }
-
-            if ($data['start_time'] >= $data['end_time']) {
-                return response()->json(['message' => '請假結束時間必須大於開始時間'], 422);
-            }
-
-            // 2️⃣ **處理附件**（如果沒有新附件，保持原本的 `attachment_id`）
             $fileRecord = null;
             if ($request->hasFile('attachment')) {
                 $file = $request->file('attachment');
-
-                // 產生唯一檔名
-                $filename = Str::uuid() . '.' . $file->getClientOriginalExtension();
-                $attachmentPath = $file->storeAs('attachments', $filename, 'public');
-
-                // 取得舊附件
-                $oldFile = File::find($leave->attachment);
-
-                // **刪除舊附件檔案**
-                if ($oldFile && Storage::exists($oldFile->leave_attachment)) {
-                    Storage::delete($oldFile->leave_attachment);
-                    Log::info("成功刪除舊附件: " . $oldFile->leave_attachment);
-                }
-
-                // **更新舊 `File` 紀錄，或新增新附件**
-                if ($oldFile) {
-                    $oldFile->update(['leave_attachment' => $attachmentPath]);
-                    $fileRecord = $oldFile;
-                } else {
-                    $fileRecord = File::create([
-                        'user_id' => $user->id,
-                        'leave_id' => $leave->id,
-                        'leave_attachment' => $attachmentPath,
-                    ]);
-                }
+                $fileRecord = $this->fileService->replaceLeaveAttachment($file, $leave, $user->id);
+                $data['attachment'] = $fileRecord->id;
+            } else {
+                $data['attachment'] = $leave->attachment;
             }
 
-            // 3️⃣ **呼叫 Service 層更新請假**
-            $updatedLeave = $this->leaveService->updateLeave($leave, [
-                'leave_type_id' => $request->input('leave_type_id'),
-                'start_time' => $request->input('start_time'),
-                'end_time' => $request->input('end_time'),
-                'reason' => $request->input('reason'),
-                'status' => $request->input('status'),
-                'attachment' => $fileRecord ? $fileRecord->id : $leave->attachment,
-            ], $user, $data['start_time']); // ✅ 修正傳遞 `start_time`
+            $updatedLeave = $this->leaveService->updateLeaveRequest($leave, $data);
 
-            // 4️⃣ **回傳成功訊息**
             return response()->json([
                 'message' => '假單更新成功',
-                'leave' => $this->formatLeave($updatedLeave),
+                'leave' => LeaveFormatter::format($updatedLeave),
             ], 200);
         } catch (\Exception $e) {
-            // 5️⃣ **回傳錯誤訊息**
             return response()->json([
                 'message' => app()->isLocal() ? $e->getMessage() : '更新失敗，請重新檢查資料格式是否錯誤',
             ], 500);
         }
     }
-
 
     // 6. 刪除請假申請 (HR、員工)
     /**
@@ -926,47 +836,12 @@ class LeaveController extends Controller
     public function deleteLeave(int $id): JsonResponse
     {
         try {
-            $user = auth()->user();  // 取得當前登入的使用者
+            $user = auth()->user();
 
-            // 1️⃣ **取得請假紀錄**
-            $leave = Leave::find($id);
+            $this->leaveService->deleteLeaveRequest($id, $user);
 
-            if (!$leave || $leave->user_id !== $user->id) {
-                // Log::warning("刪除請假失敗 - 找不到假單", ['user_id' => $user->id, 'leave_id' => $id]);
-                return response()->json(['message' => '查無此假單'], 403);
-            }
-
-            // **限制只能刪除「待審核」的假單**
-            if ($leave->status !== 0) {
-                return response()->json(['message' => '僅能刪除尚未審核的假單'], 403);
-            }
-
-            // 2️⃣ **刪除相關附件**
-            if (!empty($leave->attachment)) {
-                $file = File::find($leave->attachment);
-                if ($file) {
-                    $filePath = $file->leave_attachment;
-
-                    // **刪除實體檔案**
-                    if ($filePath && Storage::exists($filePath)) {
-                        Storage::delete($filePath);
-                        Log::info("成功刪除附件檔案: " . $filePath);
-                    }
-
-                    // **刪除 `files` 表中的紀錄**
-                    $file->delete();
-                    // Log::info("成功刪除 files 記錄", ['file_id' => $file->id]);
-                }
-            }
-
-            // 3️⃣ **刪除請假申請**
-            $leave->delete();
-            // Log::info("成功刪除假單", ['user_id' => $user->id, 'leave_id' => $id]);
-
-            // 4️⃣ **回傳成功訊息**
             return response()->json(['message' => '假單刪除成功'], 200);
         } catch (\Exception $e) {
-            // 5️⃣ **回傳錯誤訊息**
             return response()->json([
                 'message' => app()->isLocal() ? $e->getMessage() : '系統發生錯誤，請稍後再試',
             ], 500);
@@ -1022,18 +897,17 @@ class LeaveController extends Controller
     public function getRemainingLeaveHours(Request $request, int $leave_type_id): JsonResponse
     {
         try {
-            $user = auth()->user(); // 取得當前用戶
+            $user = auth()->user();
             $startTime = $request->query('start_time');
             $excludeId = $request->query('exclude_id');
 
-            // 先確保該假別存在，避免查詢無效 ID
             $leaveType = LeaveType::find($leave_type_id);
             if (!$leaveType) {
                 return response()->json([
                     'message' => '請假類型無效',
                 ], 400);
             }
-            // ✅ **直接使用 Service 層的 getRemainingLeaveHours()**
+
             $remainingHours = $this->leaveService->getRemainingLeaveHours($leave_type_id, $user->id, $startTime, $excludeId);
 
             return response()->json([
@@ -1047,28 +921,7 @@ class LeaveController extends Controller
         }
     }
 
-    // 8. 資料格式統一，讓回傳結果都長一樣 ✅    
-    private function formatLeave($leave): array
-    {
-        return [
-            'leave_id' => $leave->id,
-            'user_id' => $leave->user_id,
-            'user_name' => $leave->user->name,
-            'leave_type_id' => $leave->leave_type_id,
-            'leave_type' => optional($leave->leaveType)->name, // 確保讀取關聯名稱
-            'leave_type_name' => optional($leave->leaveType)->description,
-            'start_time' => $leave->start_time,
-            'end_time' => $leave->end_time,
-            'reason' => $leave->reason,
-            'leave_hours' => $leave->leave_hours,
-            'status' => $leave->status,
-            'reject_reason' => $leave->reject_reason,
-            'attachment' => $leave->file ? asset("storage/" . $leave->file->leave_attachment) : null,
-            'created_at' => $leave->created_at,
-        ];
-    }
-
-    // 9.部門主管審核通過
+    // 8.部門主管審核通過
     /**
      * @OA\Patch(
      *     path="/api/leave/{id}/department/approve",
@@ -1211,7 +1064,7 @@ class LeaveController extends Controller
         return response()->json(['message' => '假單已被主管審核，等待 HR 審核'], 200);
     }
 
-    // 10.部門主管審核拒絕
+    // 9.部門主管審核拒絕
     /**
      * @OA\Patch(
      *     path="/api/leave/{id}/department/reject",
@@ -1350,7 +1203,7 @@ class LeaveController extends Controller
         return response()->json(['message' => '假單已被主管拒絕'], 200);
     }
 
-    // 11.HR審核通過
+    // 10.HR審核通過
     /**
      * @OA\Patch(
      *     path="/api/leave/{id}/approve",
@@ -1462,7 +1315,7 @@ class LeaveController extends Controller
         return response()->json(['message' => '假單已最終批准'], 200);
     }
 
-    // 12.HR審核拒絕
+    // 11.HR審核拒絕
     /**
      * @OA\Patch(
      *     path="/api/leave/{id}/reject",
