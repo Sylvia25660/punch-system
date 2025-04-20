@@ -4,13 +4,21 @@ namespace App\Services;
 
 use App\Models\Leave;
 use App\Models\LeaveType;
+use App\Models\User;
 use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
 use App\Models\EmployeeProfile;
+use App\Services\FileService;
 
 class LeaveService
 {
-    const WORK_HOURS_PER_DAY = 8;  // 每天上班時數
+    const WORK_HOURS_PER_DAY = 8;
+
+    protected FileService $fileService;
+    public function __construct(FileService $fileService)
+    {
+        $this->fileService = $fileService;
+    }
 
     //  1. 申請請假
     public function applyLeave(array $data): Leave
@@ -68,40 +76,36 @@ class LeaveService
         $this->applyFilters($query, $filters);
 
         return $query->select('leaves.*')
-            ->orderByRaw('FIELD(status, 0, 1, 3, 2, 4)') // 依照 0 -> 1 -> 3 -> 2 -> 4 排序
-            ->orderBy('created_at', 'asc') // 申請時間越早，排越前
+            ->orderByRaw('FIELD(status, 0, 1, 3, 2, 4)')
+            ->orderBy('created_at', 'asc')
             ->paginate(10);
     }
 
     // 3. 查詢「部門」請假紀錄（主管 & HR）
     public function getDepartmentLeaveList($user, array $filters)
     {
-        $query = Leave::with(['user', 'file', 'employee']) // ✅ 同時載入 `user` 和 `file`
-            ->whereHas('user.employee', fn($q) => $q->where('department_id', $user->employee->department_id));
+        $departmentId = $user->employee->department_id;
+        $query = Leave::with(['user', 'file', 'employee'])
+            ->whereHas('user.employee', fn($q) => $q->where('department_id', $departmentId));
 
-        // ✅ 確保過濾條件生效
         $this->applyFilters($query, $filters);
 
         return $query->select('leaves.*')
-            ->orderByRaw('FIELD(status, 0, 1, 3, 2, 4)') // 依照 0 -> 1 -> 3 -> 2 -> 4 排序
-            ->orderBy('created_at', 'asc') // 申請時間越早，排越前
+            ->orderByRaw('FIELD(status, 0, 1, 3, 2, 4)')
+            ->orderBy('created_at', 'asc')
             ->paginate(10);
     }
 
     // 4. 查詢「全公司」請假紀錄（HR）
     public function getCompanyLeaveList(array $filters)
     {
-        // Log::info('getCompanyLeaveList called with filters:', $filters);
+        $query = Leave::with(['user', 'file']);
 
-        $query = Leave::with(['user', 'file']); // ✅ 同時載入 `user` 和 `file` 和 `employee`
-
-        // ✅ 確保過濾條件生效
         $this->applyFilters($query, $filters);
 
-        // 查詢所有請假單，分頁 10 筆
         $leaves = $query->select('*')
-            ->orderByRaw('FIELD(status, 1, 0, 3, 2, 4)') // 指定狀態排序順序
-            ->orderBy('created_at', 'asc') // 其次依據 start_time 排序
+            ->orderByRaw('FIELD(status, 1, 0, 3, 2, 4)')
+            ->orderBy('created_at', 'asc')
             ->paginate(10);
 
         Log::info('Query Result:', ['leaves' => $leaves->items()]);
@@ -110,107 +114,101 @@ class LeaveService
     }
 
     // 5. 更新單筆紀錄
-    public function updateLeave(Leave $leave, array $data, $user, $leaveStartTime): Leave
+    public function updateLeaveRequest(Leave $leave, array $data): Leave
     {
-        // 1️⃣ **是否有修改請假時數**
         $isUpdatingHours = isset($data['start_time'], $data['end_time']);
+        $startTime = $leave->start_time;
+        $endTime = $leave->end_time;
+        $hours = $leave->leave_hours;
+        $leaveTypeId = $data['leave_type_id'] ?? $leave->leave_type_id;
 
         if ($isUpdatingHours) {
             $startTime = Carbon::parse($data['start_time']);
             $endTime = Carbon::parse($data['end_time']);
 
             if ($startTime->greaterThanOrEqualTo($endTime)) {
-                throw new \Exception("請假結束時間必須大於開始時間", 400);
+                throw new \Exception("結束時間必須大於開始時間", 422);
+            }
+
+            $isOverlap = Leave::where('user_id', $leave->user_id)
+                ->where('id', '!=', $leave->id)
+                ->overlapping($startTime, $endTime)
+                ->whereIn('status', [0, 1])
+                ->exists();
+
+            if ($isOverlap) {
+                throw new \Exception("您的請假時間與已有的請假紀錄重疊，請重新調整時間範圍", 422);
+            }
+
+            $hours = $this->calculateHours($startTime, $endTime);
+            if ($hours <= 0) {
+                throw new \Exception("請假時間區間無效，請重新選擇有效的請假時段", 422);
+            }
+
+            $remainingHours = $this->getRemainingLeaveHours(
+                $leaveTypeId,
+                $leave->user_id,
+                $startTime,
+                $leave->id
+            );
+            if (!is_null($remainingHours) && $remainingHours < $hours) {
+                throw new \Exception("剩餘時數不足，請重新修改請假區間", 422);
             }
         }
 
-        // 2️⃣ **取得假別資訊**
-        $leaveTypeId = $data['leave_type_id'] ?? $leave->leave_type_id;
-        $leaveType = LeaveType::find($leaveTypeId);
-
-        if (!$leaveType) {
-            throw new \Exception("請假類型無效", 400);
-        }
-
-        // 3️⃣ **生理假檢查**
-        if ($leaveType->name === 'Menstrual Leave' && $user->gender !== 'female') {
-            throw new \Exception('您無法申請生理假', 403);
-        }
-
-        // 4️⃣ **計算新的請假時數**
-        $hours = $isUpdatingHours
-            ? $this->calculateHours($data['start_time'], $data['end_time'])
-            : $leave->leave_hours;
-
-        if ($isUpdatingHours && $hours <= 0) {
-            throw new \Exception("請假時間區間無效，請重新選擇有效的請假時段", 400);
-        }
-
-        // 6️⃣ **檢查剩餘請假時數**
-        if ($isUpdatingHours) {
-            $remainingHours = $this->getRemainingLeaveHours($leaveTypeId, $leave->user_id, $leaveStartTime, $leave->id);
-
-            if ($remainingHours < $hours) {
-                throw new \Exception("剩餘時數不足，請重新修改請假區間", 400);
-            }
-        }
-
-        // 7️⃣ **更新 `leaves` 表**
+        // update leaverequest
         $leave->update([
             'leave_type_id' => $leaveTypeId,
-            'start_time' => $data['start_time'] ?? $leave->start_time,
-            'end_time' => $data['end_time'] ?? $leave->end_time,
+            'start_time' => $startTime,
+            'end_time' => $endTime,
             'leave_hours' => $hours,
             'reason' => $data['reason'] ?? $leave->reason,
             'status' => $data['status'] ?? $leave->status,
-            'attachment' => isset($data['attachment']) ? $data['attachment'] : null,
+            'attachment' => $data['attachment'] ?? $leave->attachment,
         ]);
 
         return $leave->fresh();
     }
 
-    // 5. 計算跨天請假時數 (支援單日、跨日)
-    private function calculateHours(string $startTime, string $endTime): float
+    // 6. 刪除請假記錄
+    public function deleteLeaveRequest(int $leaveId, User $user): void
     {
-        $startDate = date('Y-m-d', strtotime($startTime));
-        $endDate = date('Y-m-d', strtotime($endTime));
+        $leave = Leave::find($leaveId);
 
-        if ($startDate === $endDate) {
-            // 同一天直接算時數
-            $hours = $this->calculateOneDayHours($startTime, $endTime);
-            if ($hours < 1) {
-                throw new \Exception("請假時間不在上班時間內，請重新選擇", 400);
-            }
-            return ceil($hours); // ✅ 無條件進位
+        if (!$leave || $leave->user_id !== $user->id) {
+            throw new \Exception('查無此假單', 403);
         }
 
-        $totalHours = 0;
-
-        // 🧮 第一天：從開始時間到當天18:00
-        $firstDayEnd = $startDate . ' 18:00:00';
-        $totalHours += $this->calculateOneDayHours($startTime, $firstDayEnd);
-
-        // 🧮 中間天（整天請假）
-        $current = date('Y-m-d', strtotime($startDate . ' +1 day'));
-        while ($current < $endDate) {
-            $dayStart = $current . ' 09:00:00';
-            $dayEnd = $current . ' 18:00:00';
-            $totalHours += $this->calculateOneDayHours($dayStart, $dayEnd);
-            $current = date('Y-m-d', strtotime($current . ' +1 day'));
+        if ($leave->status !== 0) {
+            throw new \Exception('僅能刪除尚未審核的假單', 403);
         }
 
-        // 🧮 最後一天：從 09:00 到實際結束時間
-        $lastDayStart = $endDate . ' 09:00:00';
-        $totalHours += $this->calculateOneDayHours($lastDayStart, $endTime);
-
-        if ($totalHours < 1) {
-            throw new \Exception("請假時間不在上班時間內，請重新選擇", 400);
+        if ($leave->attachment) {
+            $this->fileService->deleteAttachment($leave->attachment);
         }
 
-        return ceil($totalHours); // ✅ 最後無條件進位成整數小時
+        $leave->delete();
     }
 
-    // 6. 計算單天請假時數 (考慮上下班時間)
+    // 7. 計算特殊假別剩餘小時數
+    public function getRemainingLeaveHours($leaveTypeId, $userId, $leaveStartTime = null, $excludeLeaveId = null)
+    {
+        $leaveType = LeaveType::find($leaveTypeId);
+
+        if (!$leaveType) {
+            return null;
+        }
+
+        if ($leaveType->name === 'Annual Leave') {
+            return $this->getRemainingAnnualLeaveHours($userId, $leaveStartTime, $excludeLeaveId);
+        } elseif ($leaveType->name === 'Menstrual Leave') {
+            return $this->getRemainingMenstrualLeaveHours($userId, $leaveStartTime, $excludeLeaveId);
+        }
+
+        return $this->getGenericLeaveHours($leaveTypeId, $userId, $excludeLeaveId);
+    }
+
+    // 8. 計算單天請假時數 (考慮上下班時間)
     private function calculateOneDayHours(string $start, string $end): float
     {
         $startTime = strtotime($start);
@@ -220,11 +218,11 @@ class LeaveService
             return 0;
         }
 
-        // 如果時間不符合上班時間(可依公司規定調整)
+        // work time
         $workStart = strtotime(date('Y-m-d', $startTime) . ' 09:00:00');
         $workEnd = strtotime(date('Y-m-d', $startTime) . ' 18:00:00');
 
-        // 限制只計算上班時段
+        // Business Working Hours
         $startTime = max($startTime, $workStart);
         $endTime = min($endTime, $workEnd);
 
@@ -232,38 +230,58 @@ class LeaveService
             return 0;
         }
 
-        // 計算小時數 (包含中午休息時間可以加上去)
+        // count hours
         $hours = ($endTime - $startTime) / 3600;
 
-        // 例如：12:00-13:00是午休，這段不算工時
+        // Lunch Break Deduction
         $lunchStart = strtotime(date('Y-m-d', $startTime) . ' 12:00:00');
         $lunchEnd = strtotime(date('Y-m-d', $startTime) . ' 13:00:00');
 
         if ($startTime < $lunchEnd && $endTime > $lunchStart) {
-            $hours -= 1;  // 扣掉午休1小時
+            $hours -= 1;
         }
 
         return ceil($hours);
     }
 
-    // 7. 計算特殊假別剩餘小時數
-    public function getRemainingLeaveHours($leaveTypeId, $userId, $leaveStartTime = null, $excludeLeaveId = null)
+    // 9. 計算跨天請假時數 (支援單日、跨日)
+    private function calculateHours(string $startTime, string $endTime): float
     {
-        $leaveType = LeaveType::find($leaveTypeId);
+        $startDate = date('Y-m-d', strtotime($startTime));
+        $endDate = date('Y-m-d', strtotime($endTime));
 
-        if (!$leaveType) {
-            return null; // 假別不存在
+        if ($startDate === $endDate) {
+            $hours = $this->calculateOneDayHours($startTime, $endTime);
+            if ($hours < 1) {
+                throw new \Exception("請假時間不在上班時間內，請重新選擇", 400);
+            }
+            return ceil($hours);
         }
 
-        // 針對特休和生理假使用專門的方法計算
-        if ($leaveType->name === 'Annual Leave') {
-            return $this->getRemainingAnnualLeaveHours($userId, $leaveStartTime, $excludeLeaveId);
-        } elseif ($leaveType->name === 'Menstrual Leave') {
-            return $this->getRemainingMenstrualLeaveHours($userId, $leaveStartTime, $excludeLeaveId);
+        $totalHours = 0;
+
+        // first
+        $firstDayEnd = $startDate . ' 18:00:00';
+        $totalHours += $this->calculateOneDayHours($startTime, $firstDayEnd);
+
+        // mid 
+        $current = date('Y-m-d', strtotime($startDate . ' +1 day'));
+        while ($current < $endDate) {
+            $dayStart = $current . ' 09:00:00';
+            $dayEnd = $current . ' 18:00:00';
+            $totalHours += $this->calculateOneDayHours($dayStart, $dayEnd);
+            $current = date('Y-m-d', strtotime($current . ' +1 day'));
         }
 
-        // 其他假別使用通用計算方式
-        return $this->getGenericLeaveHours($leaveTypeId, $userId, $excludeLeaveId);
+        // last
+        $lastDayStart = $endDate . ' 09:00:00';
+        $totalHours += $this->calculateOneDayHours($lastDayStart, $endTime);
+
+        if ($totalHours < 1) {
+            throw new \Exception("請假時間不在上班時間內，請重新選擇", 400);
+        }
+
+        return ceil($totalHours);
     }
 
     // 8. 統一查詢結果及修改格式
@@ -279,13 +297,13 @@ class LeaveService
                     });
             });
 
-            if (!empty($filters['leave_type'])) {
+            if (!empty($filters['leave_type_id'])) {
                 $query->whereHas('leaveType', function ($q) use ($filters) {
-                    $q->where('id', $filters['leave_type']);
+                    $q->where('id', $filters['leave_type_id']);
                 });
             }
 
-            if (isset($filters['status'])) { // 檢查 status 是否存在(防止0被empty過濾掉改使用isset)
+            if (isset($filters['status'])) {
                 $query->where('status', $filters['status']);
             }
 
@@ -318,7 +336,7 @@ class LeaveService
             case ($years >= 10):
                 return min(15 + ($years - 10), 30);
             default:
-                return 0;  // 不滿6個月沒特休
+                return 0;
         }
     }
 
@@ -331,16 +349,14 @@ class LeaveService
             return 0;
         }
 
-        // ✅ **動態計算年資**
+        // 	Years of Experience
         $leaveDate = Carbon::parse($leaveStartTime);
-        $years = $profile->getYearsOfServiceAttribute($leaveDate); // ✅ 使用 `getYearsOfServiceAttribute()`
-        $months = $profile->getMonthsOfServiceAttribute($leaveDate); // ✅ 也計算月數
+        $years = $profile->getYearsOfServiceAttribute($leaveDate);
+        $months = $profile->getMonthsOfServiceAttribute($leaveDate);
 
-
-        // ✅ **計算該年度可請的特休天數**
+        // Calculate Annual Leave Hours
         $newAnnualLeaveDays = $this->calculateAnnualLeaveDays($years, $months);
         $newAnnualLeaveHours = $newAnnualLeaveDays * 8;
-
 
         return $newAnnualLeaveHours;
     }
@@ -348,29 +364,28 @@ class LeaveService
     //  11. 剩餘特休時數
     public function getRemainingAnnualLeaveHours($userId, $leaveStartTime, $excludeLeaveId = null)
     {
-        // ✅ **解析使用者請假的時間**
+        // check Leave time
         $leaveDate = Carbon::parse($leaveStartTime, 'Asia/Taipei');
-        $year = $leaveDate->year; // 取得請假年份
+        $year = $leaveDate->year;
 
-        // ✅ **獲取該年份的特休時數**
+        // get Annual Leave Hours
         $totalHours = $this->getAnnualLeaveHours($userId, $leaveDate);
 
-        // ✅ **查詢該年度已請的特休時數**
+        // get be used Annual Leave Hours
         $usedHoursQuery = Leave::where('user_id', $userId)
             ->whereHas('leaveType', function ($query) {
                 $query->where('name', 'Annual Leave');
             })
-            ->whereIn('status', [0, 1, 3]) // ✅ 只計算「待審核、已批准」的假單
-            ->whereYear('start_time', $year); // ✅ 確保是當年度的特休
+            ->whereIn('status', [0, 1, 3])
+            ->whereYear('start_time', $year);
 
-        // 若為編輯假單，排除當前假單
+        // Exclude Leave
         if (!is_null($excludeLeaveId)) {
             $usedHoursQuery->where('id', '!=', $excludeLeaveId);
         }
 
         $usedHoursSum = $usedHoursQuery->sum('leave_hours');
 
-        // ✅ **確保特休時數不為負數**
         $remainingHours = max($totalHours - $usedHoursSum, 0);
 
         return $remainingHours;
@@ -379,15 +394,14 @@ class LeaveService
     // 12. 計算生理假剩餘時數
     public function getRemainingMenstrualLeaveHours($userId, $leaveStartTime, $excludeLeaveId = null)
     {
-        $leaveDate = Carbon::parse($leaveStartTime, 'Asia/Taipei'); // ✅ 依據使用者輸入的時間來決定月份
+        $leaveDate = Carbon::parse($leaveStartTime, 'Asia/Taipei');
         $maxHours = LeaveType::where('name', 'Menstrual Leave')->value('total_hours') ?? 8;
 
-        // ✅ **當月範圍**
+        // Current Month	
         $thisMonthStart = $leaveDate->copy()->startOfMonth();
         $thisMonthEnd = $leaveDate->copy()->endOfMonth();
 
-
-        // ✅ **計算當月已批准的請假時數**
+        // approved Menstrual Leave Hours
         $approvedHours = Leave::where('user_id', $userId)
             ->whereHas('leaveType', function ($query) {
                 $query->where('name', 'Menstrual Leave');
@@ -396,8 +410,7 @@ class LeaveService
             ->whereBetween('start_time', [$thisMonthStart, $thisMonthEnd])
             ->sum('leave_hours');
 
-
-        // ✅ **計算當月待審核的請假時數**
+        // Pending Leave Hours
         $pendingQuery = Leave::where('user_id', $userId)
             ->whereHas('leaveType', function ($query) {
                 $query->where('name', 'Menstrual Leave');
@@ -410,16 +423,15 @@ class LeaveService
 
         $pendingHours = $pendingQuery->sum('leave_hours');
 
-        // ✅ **補回的生理假時數**
+        // reset hours
         $resetHours = $this->resetMenstrualLeaveHours($userId, $leaveStartTime);
 
-        // ✅ **當月總額度 = 8 小時 + 上個月請假時數（最多 8 小時）**
+        // max 8 hours
         $totalAvailableHours = min($maxHours, $resetHours + $maxHours);
 
-        // ✅ **計算總已請假時數**
+        // approved + Pending
         $usedHours = $approvedHours + $pendingHours;
 
-        // ✅ **計算剩餘可請時數**
         $remainingHours = max($totalAvailableHours - $usedHours, 0);
 
         return $remainingHours;
@@ -428,28 +440,26 @@ class LeaveService
     // 13. 重置員工生理假剩餘時數
     public function resetMenstrualLeaveHours($userId, $leaveStartTime)
     {
-        // ✅ **根據使用者輸入的請假時間，決定該請假屬於哪一個月份**
+        // Current Month
         $leaveDate = Carbon::parse($leaveStartTime, 'Asia/Taipei');
 
-        // ✅ **找「上個月」的時間範圍**
+        // Last Month
         $lastMonthStart = $leaveDate->copy()->subMonth()->startOfMonth();
         $lastMonthEnd = $leaveDate->copy()->subMonth()->endOfMonth();
 
-
-        // ✅ **每個月固定 8 小時**
+        // 8 hours per month
         $maxHours = LeaveType::where('name', 'Menstrual Leave')->value('total_hours') ?? 8;
 
-        // ✅ **計算上個月已使用的生理假時數**
+        // Used Hours
         $lastMonthUsedHours = Leave::where('user_id', $userId)
             ->whereHas('leaveType', function ($query) {
                 $query->where('name', 'Menstrual Leave');
             })
-            ->whereIn('status', [0, 1, 3]) // ✅ 包含「待審核」、「主管通過」、「HR 通過」
+            ->whereIn('status', [0, 1, 3])
             ->whereBetween('start_time', [$lastMonthStart, $lastMonthEnd])
             ->sum('leave_hours');
 
-
-        // ✅ **當月的總額度 = 8 小時 + 上個月使用的時數（最多 8 小時）**
+        // Max 8 hours
         $resetHours = min($maxHours, $lastMonthUsedHours);
 
         return $resetHours;
@@ -461,16 +471,13 @@ class LeaveService
         $leaveType = LeaveType::find($leaveTypeId);
 
         if (!$leaveType) {
-            Log::warning("⚠️ 假別 ID {$leaveTypeId} 不存在，回傳 0");
             return 0;
         }
 
         if (is_null($leaveType->total_hours)) {
-            Log::warning("⚠️ 假別 `{$leaveType->name}` 沒有時數上限，回傳 5000");
-            return 5000;
+            return null;
         }
 
-        // **計算已使用時數**
         $totalHours = $leaveType->total_hours;
         $usedHoursQuery = Leave::where('user_id', $userId)
             ->where('leave_type_id', $leaveTypeId)
