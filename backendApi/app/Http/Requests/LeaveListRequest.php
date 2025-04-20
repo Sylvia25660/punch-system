@@ -23,12 +23,15 @@ class LeaveListRequest extends FormRequest
     public function rules(): array
     {
         return [
-            //
             'start_date' => ['required', 'date'],
             'end_date' => ['required', 'date', 'after_or_equal:start_date'],
-            'leave_type' => ['nullable', 'exists:leave_types,id'],  // 驗證 leave_type 是 leave_types 表中的有效 id
-            'attachment' => 'nullable|exists:files,id',  // 驗證 attachment 是 files 表中的有效 id
-            'status' => 'nullable|integer|in:0,1,2,3,4,5',
+            'leave_type_id' => ['nullable', 'exists:leave_types,id'],
+            'status' => ['nullable', 'integer', 'in:0,1,2,3,4,5'],
+            'employee_id' => ['nullable', 'exists:employees,id'],
+            'department_id' => ['nullable', 'exists:departments,id'],
+            'rejected' => ['nullable', 'integer'],
+            'leave_hours' => ['nullable', 'numeric'],
+            'created_at' => ['nullable', 'date'],
         ];
     }
 }
