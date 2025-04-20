@@ -31,7 +31,7 @@ class LeaveService
         if ($start >= $end) {
             throw new \Exception('結束時間必須大於開始時間', 422);
         }
-        
+
         // check time range
         $isOverlap = Leave::where('user_id', $userId)
             ->overlapping($start, $end)

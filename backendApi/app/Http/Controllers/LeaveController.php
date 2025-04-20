@@ -172,9 +172,8 @@ class LeaveController extends Controller
 
             return response()->json([
                 'message' => '申請成功，假單已送出',
-                'leave' =>  LeaveFormatter::format($leave),
+                'leave' => LeaveFormatter::format($leave),
             ], 201);
-
         } catch (\Throwable $e) {
             return response()->json([
                 'message' => $e->getMessage(),
