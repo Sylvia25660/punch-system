@@ -124,7 +124,6 @@ function ApproveLeave() {
         setSearchLeaveTypeOptions(searchOptions);
         setFormLeaveTypeOptions(allTypes);
       } catch (error) {
-        // console.error("❌ 取得 leave types 失敗", error);
       }
     };
     fetchLeaveTypes();
@@ -145,7 +144,7 @@ function ApproveLeave() {
     try {
       const apiRoute = "/leave/my-records";
       const params = {
-        ...(selectedLeaveType && selectedLeaveType !== "所有假別" && { leave_type: selectedLeaveType }),
+        ...(selectedLeaveType && selectedLeaveType !== "所有假別" && { leave_type_id: selectedLeaveType }),
         ...(status !== "" && status !== "全部狀態" ? { status } : {}),
         ...(startDate && { start_date: dayjs(startDate).format("YYYY-MM-DD"), }),
         ...(endDate && { end_date: dayjs(endDate).format("YYYY-MM-DD"), }),
@@ -153,11 +152,9 @@ function ApproveLeave() {
       };
 
       const res = await API.get(apiRoute, { params });
-      // console.log("請假紀錄：", res.data);
       setLeaveRequests(res.data?.records || []);
       setTotalPages(Math.ceil((res.data?.total || 0) / pageSize));
     } catch (error) {
-      // console.error("取得請假資料失敗", error);
       setLeaveRequests([]);
       setTotalPages(1);
     }
@@ -173,11 +170,10 @@ function ApproveLeave() {
 
   // 初始化 react-hook-form (表單管理)
   const {
-    handleSubmit,   // 表單送出，處理驗證
-    reset,          // 重置表單
-    register,       // 綁定欄位給 Hook Form 管理
+    handleSubmit,
+    reset,
+    register,
     control,
-    setValue,
     watch,
     formState: { errors },
   } = useForm();
@@ -190,7 +186,7 @@ function ApproveLeave() {
   const hasInitializedRef = useRef(false);
   const [policyOpen, setPolicyOpen] = useState(false);
 
-  // 🧼 統一初始化表單（根據 mode 決定）
+  // 統一初始化表單
   const initForm = (request, openMode) => {
     if (openMode === "create") {
       const now = dayjs();
@@ -228,7 +224,6 @@ function ApproveLeave() {
         reason: request.reason ?? "",
       });
 
-      // 如果是編輯模式就查詢剩餘時數
       if (openMode !== "view" && leaveTypesWithLimit.includes(Number(typeId))) {
         fetchRemainingLeaveHours(typeId, start);
       }
@@ -237,13 +232,12 @@ function ApproveLeave() {
 
   // 開啟彈窗
   const handleOpen = (request = null, openMode = "create") => {
-    // console.log("🧾 handleOpen 傳入的 request：", request);
     setSelectedRequest(request);
     setCurrentLeaveId(request?.leave_id ?? null);
     setMode(openMode);
     setOpen(true);
 
-    if (formLeaveTypeOptions.length) {   // 在打開彈窗時直接初始化表單
+    if (formLeaveTypeOptions.length) {
       initForm(request, openMode);
     }
   };
@@ -254,14 +248,14 @@ function ApproveLeave() {
         hasInitializedRef.current = true;
       }
     } else {
-      hasInitializedRef.current = false; // 關閉時重設
+      hasInitializedRef.current = false;
     }
   }, [open, formLeaveTypeOptions, selectedRequest, mode]);
 
   // 關閉彈窗
   const handleClose = () => setOpen(false);
 
-  // 切換請假類型時，自動查詢特殊假別剩餘時數
+  // 談窗內切換請假類型時，自動查詢特殊假別剩餘時數
   const fetchRemainingLeaveHours = async (
     leaveTypeId,
     dateFromForm = watch("startTime")
@@ -283,9 +277,7 @@ function ApproveLeave() {
         },
       });
       setLeaveHours(res.data?.remaining_hours ?? null);
-      // console.log("✅ 剩餘請假時數查詢成功", res.data);
     } catch (error) {
-      // console.error("❌ 查詢失敗", error);
       setLeaveHours(null);
     }
   };
@@ -307,7 +299,6 @@ function ApproveLeave() {
     };
 
     if (!permissions.includes(permissionMap[mode])) {
-      // console.warn("⚠️ 權限不足");
       return;
     }
 
@@ -322,18 +313,16 @@ function ApproveLeave() {
           "Content-Type": "multipart/form-data",
         },
       });
-      // console.log(`📌 ${mode === "create" ? "申請" : "修改"}成功`, res.data);
       setDialogMessage("假單已成功送出，請靜候審核～");
       setDialogSuccess(true);
       setDialogOpen(true);
       const leaveTypeId = Number(leaveData.get("leave_type_id"));
       const leaveStartTime = dayjs(leaveData.get("start_time"));
-      fetchRemainingLeaveHours(leaveTypeId, leaveStartTime);     // 正確查詢剩餘時數
-      fetchLeaveRequests(); // 更新列表
+      fetchRemainingLeaveHours(leaveTypeId, leaveStartTime);
+      fetchLeaveRequests();
       setPage(1);
       setDialogOpen(true);
     } catch (error) {
-      // console.error(`❌ ${mode === "create" ? "申請" : "修改"}失敗`, error);
       const errorMsg =
         error.response?.data?.message ||
         "申請失敗，請檢查輸入資訊是否有誤。";
@@ -362,9 +351,9 @@ function ApproveLeave() {
     handleClose();
   };
 
-  const [deleteId, setDeleteId] = useState(null); // 要刪除的假單 ID
-  const [openConfirm, setOpenConfirm] = useState(false); // 是否開啟確認刪除 Dialog
-  const [errorDialogOpen, setErrorDialogOpen] = useState(false); // 刪除失敗 Dialog
+  const [deleteId, setDeleteId] = useState(null);
+  const [openConfirm, setOpenConfirm] = useState(false);
+  const [errorDialogOpen, setErrorDialogOpen] = useState(false);
 
   // 刪除個人待審核假單
   const handleDelete = (request) => {
